@@ -46,6 +46,14 @@ specifications. If one is not provided, it defaults to 12 hour intervals. If you
 with feed providors dropping connections, use `WithDefaultUpdateInterval` to set the default update
 interval.
 
+By default, only the first item seen for each ID is retained, both when parsing and when updating.
+Feeds occasionally republish an item under the same ID with corrected content and a later date. To
+merge such revisions instead of ignoring them, enable `WithMergeRevisions`. When enabled, a later
+item with a seen ID replaces the existing item in place when its normalised date is later; items
+with equal dates keep the first occurrence, and an item without a date never replaces one that has
+one. The existing item's position, pointer, and `Read` state are preserved, revisions never change
+`Unread`, and items missing from the newer feed are retained.
+
 The project is not proactively maintained, but I'll respond to issues and PRs as soon as I can.
 
 [Atom 1.0]: https://datatracker.ietf.org/doc/html/rfc4287

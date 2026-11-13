@@ -71,13 +71,8 @@ func (r *Reader) ConvertAtom1(url string, atomFeed *atom1.Feed) (*Feed, error) {
 	}
 
 	// Process items.
-	seen := make(map[string]struct{})
+	index := make(map[string]int)
 	for _, item := range atomFeed.Items {
-		// Skip items already seen.
-		if _, ok := seen[item.ID]; ok {
-			continue
-		}
-
 		if item.ID == "" {
 			r.warn(ctx, "item has no ID or link and will be ignored", slog.String("item-title", item.Title))
 			continue
@@ -106,9 +101,7 @@ func (r *Reader) ConvertAtom1(url string, atomFeed *atom1.Feed) (*Feed, error) {
 			})
 		}
 
-		seen[next.ID] = struct{}{}
-		feed.Items = append(feed.Items, next)
-		feed.Unread++
+		r.addItem(feed, index, next)
 	}
 
 	if feed.Links == nil {

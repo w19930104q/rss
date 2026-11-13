@@ -47,7 +47,7 @@ func (r *Reader) ConvertRSS1(url string, rssFeed *rss1.Feed) (*Feed, error) {
 	}
 
 	// Process items.
-	seen := make(map[string]struct{})
+	index := make(map[string]int)
 	for _, item := range rssFeed.Items {
 		if item.ID == "" {
 			if item.Link == "" {
@@ -56,11 +56,6 @@ func (r *Reader) ConvertRSS1(url string, rssFeed *rss1.Feed) (*Feed, error) {
 			}
 
 			item.ID = item.Link
-		}
-
-		// Skip items already seen.
-		if _, ok := seen[item.ID]; ok {
-			continue
 		}
 
 		next := &Item{
@@ -94,9 +89,7 @@ func (r *Reader) ConvertRSS1(url string, rssFeed *rss1.Feed) (*Feed, error) {
 			}
 		}
 
-		seen[next.ID] = struct{}{}
-		feed.Items = append(feed.Items, next)
-		feed.Unread++
+		r.addItem(feed, index, next)
 	}
 
 	if feed.Links == nil {

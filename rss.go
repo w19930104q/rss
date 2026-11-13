@@ -81,6 +81,7 @@ type Reader struct {
 
 	// Parsing config.
 	defaultUpdateInterval        time.Duration // Minimum time before updating a feed that hasn't specified an interval.
+	mergeRevisions               bool          // Whether to merge items with a seen ID rather than ignoring them.
 	timeLayouts                  []string
 	timeLayoutsWithNamedLocation []string
 }
@@ -256,9 +257,9 @@ func (r *Reader) waitForFeed(ctx context.Context, feed *Feed) error {
 // an appropriate interval has passed since the last
 // update.
 func (r *Reader) update(ctx context.Context, feed *Feed) error {
-	seen := make(map[string]struct{})
-	for _, item := range feed.Items {
-		seen[item.ID] = struct{}{}
+	index := make(map[string]int, len(feed.Items))
+	for i, item := range feed.Items {
+		index[item.ID] = i
 	}
 
 	update, err := r.Fetch(ctx, feed.UpdateURL)
@@ -271,11 +272,11 @@ func (r *Reader) update(ctx context.Context, feed *Feed) error {
 	feed.Description = update.Description
 
 	for _, item := range update.Items {
-		if _, ok := seen[item.ID]; !ok {
-			seen[item.ID] = struct{}{}
-			feed.Items = append(feed.Items, item)
-			feed.Unread++
-		}
+		// New IDs are appended in first-seen order and
+		// counted as unread once. Seen IDs are ignored
+		// or merged in place according to the reader's
+		// revision policy, leaving Unread unchanged.
+		r.addItem(feed, index, item)
 	}
 
 	return nil
@@ -327,6 +328,31 @@ func WithHTTPClient(client *http.Client) Option {
 func WithDefaultUpdateInterval(interval time.Duration) Option {
 	return func(r *Reader) error {
 		r.defaultUpdateInterval = interval
+		return nil
+	}
+}
+
+// WithMergeRevisions enables merging of feed items
+// that share an ID with an item already seen during
+// parsing or updating.
+//
+// By default, only the first item seen for each ID
+// is retained and later items with the same ID are
+// ignored, matching the usual behaviour of feed
+// aggregators.
+//
+// When enabled, a later item with a seen ID replaces
+// the existing item when its normalised Date is later.
+// Items with equal dates keep the one that appeared
+// first, and an item without a date never replaces an
+// item that has one. The replacement happens in place,
+// so the existing item's position, pointer, and Read
+// state are preserved, and revisions never change
+// Feed.Unread. Items whose ID does not appear in the
+// newer data are left untouched.
+func WithMergeRevisions() Option {
+	return func(r *Reader) error {
+		r.mergeRevisions = true
 		return nil
 	}
 }
