@@ -67,6 +67,20 @@ import (
 // not yet elapsed.
 var ErrTooSoon = errors.New("rss: too soon to update feed")
 
+// StatusError indicates that a feed's server responded
+// with a non-2xx status code, such as 410 Gone when a
+// feed has been removed.
+type StatusError struct {
+	URL        string // The URL that was requested.
+	Status     string // The response status, such as "410 Gone".
+	StatusCode int    // The response status code, such as 410.
+}
+
+// Error implements the error interface.
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("rss: server responded with %s for %s", e.Status, e.URL)
+}
+
 // Reader stores the configuration data used to fetch,
 // parse, and update RSS feeds. Reader supports RSS 2.0,
 // RSS 1.0, and Atom 1.0. A single Reader can process
@@ -150,30 +164,67 @@ func (r *Reader) error(ctx context.Context, msg string, attrs ...slog.Attr) {
 
 // Fetch downloads and parses the RSS/Atom feed at
 // the given URL.
+//
+// If the server responds with a non-2xx status code,
+// Fetch returns a [*StatusError].
 func (r *Reader) Fetch(ctx context.Context, url string) (*Feed, error) {
+	feed, _, err := r.fetch(ctx, url, "", "")
+	return feed, err
+}
+
+// fetch downloads and parses the RSS/Atom feed at the
+// given URL. If etag or lastModified are provided, they
+// are sent as conditional request headers; if the server
+// then responds with 304 Not Modified, fetch returns
+// notModified as true and no feed.
+func (r *Reader) fetch(ctx context.Context, url, etag, lastModified string) (feed *Feed, notModified bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to construct GET request: %v", err)
+		return nil, false, fmt.Errorf("failed to construct GET request: %v", err)
+	}
+
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+	if lastModified != "" {
+		req.Header.Set("If-Modified-Since", lastModified)
 	}
 
 	res, err := r.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to request feed: %v", err)
+		return nil, false, fmt.Errorf("failed to request feed: %v", err)
 	}
 
-	feed, err := r.Parse(url, res.Body)
+	if res.StatusCode == http.StatusNotModified {
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+		return nil, true, nil
+	}
+
+	if res.StatusCode < 200 || res.StatusCode > 299 {
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+		return nil, false, &StatusError{URL: url, Status: res.Status, StatusCode: res.StatusCode}
+	}
+
+	feed, err = r.Parse(url, res.Body)
 	if err != nil {
 		io.Copy(io.Discard, res.Body)
 		res.Body.Close()
-		return nil, fmt.Errorf("failed to parse feed: %v", err)
+		return nil, false, fmt.Errorf("failed to parse feed: %v", err)
 	}
 
 	err = res.Body.Close()
 	if err != nil {
-		return nil, fmt.Errorf("failed to close response body: %v", err)
+		return nil, false, fmt.Errorf("failed to close response body: %v", err)
 	}
 
-	return feed, nil
+	// Record the response's validators so that future
+	// updates can make conditional requests.
+	feed.etag = res.Header.Get("ETag")
+	feed.lastModified = res.Header.Get("Last-Modified")
+
+	return feed, false, nil
 }
 
 // Parse RSS or Atom data.
@@ -196,6 +247,13 @@ func (r *Reader) Parse(url string, data io.Reader) (*Feed, error) {
 // Update attempts to update the feed with new items.
 // If it is too soon to update the feed, Update will
 // return immediately with [ErrTooSoon].
+//
+// A successful update replaces the feed's items with
+// exactly those currently published, in the published
+// order: new items are added, items that have been
+// removed from the feed are dropped, and the read
+// state of the remaining items is preserved. If the
+// request or parsing fails, the feed is left unchanged.
 //
 // Callers that would rather wait until an update can
 // be performed should instead use [Reader.UpdatePatiently].
@@ -255,28 +313,63 @@ func (r *Reader) waitForFeed(ctx context.Context, feed *Feed) error {
 // update performs an update to a feed. It assumes
 // an appropriate interval has passed since the last
 // update.
+//
+// The update is atomic: if the request or parsing fails,
+// the feed is left unchanged. On success, the feed's
+// items are replaced with exactly those in the latest
+// version of the feed, in the same order, so that
+// repeated updates converge on the same state as a
+// fresh [Reader.Fetch]. Items that are no longer
+// present are removed, and the read state of items
+// that remain is preserved.
 func (r *Reader) update(ctx context.Context, feed *Feed) error {
-	seen := make(map[string]struct{})
-	for _, item := range feed.Items {
-		seen[item.ID] = struct{}{}
-	}
-
-	update, err := r.Fetch(ctx, feed.UpdateURL)
+	update, notModified, err := r.fetch(ctx, feed.UpdateURL, feed.etag, feed.lastModified)
 	if err != nil {
-		return fmt.Errorf("failed to update feed: %v", err)
+		return fmt.Errorf("failed to update feed: %w", err)
 	}
 
+	if notModified {
+		// The feed hasn't changed. As we have no new
+		// timing information, use the default interval
+		// before checking again.
+		feed.NextUpdate = r.now().Add(r.defaultUpdateInterval)
+		return nil
+	}
+
+	// Record the read state of the current items, so
+	// that it can be carried over to items that are
+	// still present in the update.
+	previous := make(map[string]*Item, len(feed.Items))
+	for _, item := range feed.Items {
+		if item.ID == "" {
+			continue
+		}
+		if _, ok := previous[item.ID]; !ok {
+			previous[item.ID] = item
+		}
+	}
+
+	items := make([]*Item, 0, len(update.Items))
+	var unread uint32
+	for _, item := range update.Items {
+		if item.ID != "" {
+			if prev, ok := previous[item.ID]; ok {
+				item.Read = prev.Read
+			}
+		}
+		if !item.Read {
+			unread++
+		}
+		items = append(items, item)
+	}
+
+	feed.Items = items
+	feed.Unread = unread
 	feed.NextUpdate = update.NextUpdate
 	feed.Title = update.Title
 	feed.Description = update.Description
-
-	for _, item := range update.Items {
-		if _, ok := seen[item.ID]; !ok {
-			seen[item.ID] = struct{}{}
-			feed.Items = append(feed.Items, item)
-			feed.Unread++
-		}
-	}
+	feed.etag = update.etag
+	feed.lastModified = update.lastModified
 
 	return nil
 }

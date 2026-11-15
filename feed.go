@@ -19,6 +19,13 @@ type (
 		Items       []*Item
 		NextUpdate  time.Time // Earliest time this feed should next be checked.
 		Unread      uint32    // Number of unread items. Used by aggregators.
+
+		// Validators from the last successful fetch, used
+		// to make conditional requests when updating. These
+		// are unexported so that they don't affect JSON
+		// encodings of the feed.
+		etag         string
+		lastModified string
 	}
 
 	// Author records information about
